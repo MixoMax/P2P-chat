@@ -1,4 +1,4 @@
-import socket, json, threading, time, sys, select
+import socket, json, threading, time, sys
 
 RENDEZVOUS  = ("188.245.231.101", 10069)
 MY_NAME     = sys.argv[1]
@@ -11,8 +11,9 @@ my_priv_ip   = socket.gethostbyname(socket.gethostname())
 my_priv_port = sock.getsockname()[1]
 
 # 1. Register
-reg = {"type": "register", "name": MY_NAME, "priv": [my_priv_ip, my_priv_port]}
-sock.sendto(json.dumps(reg).encode(), RENDEZVOUS)
+sock.sendto(json.dumps({
+    "type": "register", "name": MY_NAME, "priv": [my_priv_ip, my_priv_port]
+}).encode(), RENDEZVOUS)
 
 my_pub = None
 while True:
@@ -24,7 +25,9 @@ while True:
         break
 
 # 2. Request connection
-sock.sendto(json.dumps({"type": "connect", "name": MY_NAME, "target": TARGET_NAME}).encode(), RENDEZVOUS)
+sock.sendto(json.dumps({
+    "type": "connect", "name": MY_NAME, "target": TARGET_NAME
+}).encode(), RENDEZVOUS)
 
 peer_pub = peer_priv = None
 while True:
@@ -35,26 +38,60 @@ while True:
         peer_priv = tuple(msg["priv"])
         break
 
-# 3. Pick address
+# 3. Pick initial address (may get corrected after punch discovery)
 if peer_pub[0] == my_pub[0]:
     peer_addr = peer_priv
     print(f"Same public IP — using LAN address {peer_addr}")
 else:
     peer_addr = peer_pub
-    print(f"Punching hole to {peer_addr}")
+    print(f"Initial peer address: {peer_addr}")
 
-# 4. Hole punch — send more punches over a longer window
-#    so the NAT mapping is definitely open before the other side sends
-print("Punching...", end=" ", flush=True)
-for _ in range(10):
-    sock.sendto(json.dumps({"type": "punch"}).encode(), peer_addr)
-    time.sleep(0.2)
-print("done.")
+# 4. Punch AND discover real NAT port
+#
+# Both sides send punches. The first punch packet we RECEIVE from the peer
+# tells us the actual NAT-assigned source port for traffic toward US.
+# We update peer_addr to that observed address.
 
-# 5. Receiver thread — writes above the current input line
-import os
-is_windows = os.name == 'nt'
+sock.settimeout(2.0)
+print("Punching and discovering real NAT port...")
 
+observed_peer_addr = None
+
+def send_punches():
+    for _ in range(15):
+        sock.sendto(json.dumps({"type": "punch"}).encode(), peer_addr)
+        time.sleep(0.2)
+
+punch_thread = threading.Thread(target=send_punches, daemon=True)
+punch_thread.start()
+
+# Listen for the peer's punches — the source address is the ground truth
+deadline = time.time() + 5.0
+while time.time() < deadline:
+    try:
+        data, src = sock.recvfrom(1024)
+        msg = json.loads(data)
+        if msg.get("type") == "punch" and src != RENDEZVOUS:
+            if observed_peer_addr is None:
+                observed_peer_addr = src
+                print(f"Observed real peer address from punch: {src}")
+            # Send a punch back to the observed address immediately
+            sock.sendto(json.dumps({"type": "punch"}).encode(), src)
+    except socket.timeout:
+        continue
+    except json.JSONDecodeError:
+        continue
+
+punch_thread.join()
+
+if observed_peer_addr:
+    peer_addr = observed_peer_addr
+    print(f"Using discovered address: {peer_addr}")
+else:
+    print(f"WARNING: Never received a punch back. Using original address {peer_addr}.")
+    print("Messages may not get through (symmetric NAT?).")
+
+# 5. Receiver
 print_lock = threading.Lock()
 
 def receiver():
@@ -65,11 +102,7 @@ def receiver():
             msg = json.loads(data)
             if msg.get("type") == "chat":
                 with print_lock:
-                    if is_windows:
-                        # Overwrite the "> " prompt line cleanly
-                        sys.stdout.write(f"\r\033[K[{src[0]}]: {msg['text']}\n> ")
-                    else:
-                        sys.stdout.write(f"\r\033[K[{src[0]}]: {msg['text']}\n> ")
+                    sys.stdout.write(f"\r\033[K[{src[0]}]: {msg['text']}\n> ")
                     sys.stdout.flush()
         except socket.timeout:
             pass
@@ -89,7 +122,7 @@ def keepalive():
 
 threading.Thread(target=keepalive, daemon=True).start()
 
-# 7. Input loop — use a simple blocking input, receiver prints above it
+# 7. Chat
 print("Connected! Type messages (Ctrl+C to quit):")
 while True:
     try:
