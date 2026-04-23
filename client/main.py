@@ -204,6 +204,31 @@ def main():
     # Crucial: route raw inbound socket reads to decrypt raw chat messages 
     hooked_sock.on_raw_inbound = session_mgr.handle_raw
 
+    # Route rendezvous packets caught by transport back to rendezvous client
+    def on_rendezvous_msg(addr, msg):
+        if addr == rendezvous.server_addr:
+            if msg.get("type") == "peer":
+                rendezvous.handle_message(msg)
+                peer_name = msg.get("name")
+                if peer_name:
+                    info = {
+                        "name":         peer_name,
+                        "pub":          tuple(msg["pub"]),
+                        "priv":         tuple(msg["priv"]),
+                        "ed25519":      bytes.fromhex(msg["ed25519"]),
+                        "relay_x25519": bytes.fromhex(msg["relay_x25519"]),
+                    }
+                    rendezvous.cache_peer(peer_name, info)
+                    if not session_mgr.get_session(peer_name):
+                        log.info("Received unsolicited intro for %s, starting connection", peer_name)
+                        session_mgr.connect(info, my_pub_addr)
+            elif msg.get("type") in ("error", "peer_list"):
+                rendezvous.handle_message(msg)
+
+    transport.on_control("peer", on_rendezvous_msg)
+    transport.on_control("error", on_rendezvous_msg)
+    transport.on_control("peer_list", on_rendezvous_msg)
+
     # 6. Relay System Integration
     def on_relay_deliver(sender, plaintext_bytes, msg_id):
         text = plaintext_bytes.decode(errors='replace')

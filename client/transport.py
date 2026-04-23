@@ -26,11 +26,11 @@ import config
 log = logging.getLogger("transport")
 
 # ── Fragment header ───────────────────────────────────────────────────────────
-# [16B: transfer_id UUID][4B: seq][4B: total][2B: flags][payload...]
+# [4B: magic][16B: transfer_id UUID][4B: seq][4B: total][2B: flags][payload...]
 # flags bit 0: is_ack
 
-_HDR = struct.Struct(">16sIIH")
-HDR_SIZE  = _HDR.size          # 26 bytes
+_HDR = struct.Struct(">4s16sIIH")
+HDR_SIZE  = _HDR.size          # 26 bytes -> 30 bytes
 FLAG_ACK  = 0x0001
 FLAG_META = 0x0002             # first fragment carries JSON metadata
 
@@ -103,7 +103,7 @@ class Transport:
         def send_fragment(seq: int):
             chunk = segs[seq]
             flags = FLAG_META if seq == 0 else 0
-            hdr   = _HDR.pack(tid, seq, total, flags)
+            hdr   = _HDR.pack(b"FRAG", tid, seq, total, flags)
             if seq == 0 and meta:
                 meta_bytes = json.dumps(meta).encode()
                 meta_len   = struct.pack(">H", len(meta_bytes))
@@ -176,10 +176,10 @@ class Transport:
                 self._last_seen[addr] = time.time()
 
             # Distinguish fragment packets from control JSON
-            if len(data) >= HDR_SIZE:
+            if len(data) >= HDR_SIZE and data.startswith(b"FRAG"):
                 # Peek at the first 16+4+4+2 bytes; if it looks like a fragment, handle it
                 try:
-                    tid, seq, total, flags = _HDR.unpack(data[:HDR_SIZE])
+                    magic, tid, seq, total, flags = _HDR.unpack(data[:HDR_SIZE])
                     if flags & FLAG_ACK:
                         tid_str = tid.hex()
                         with self._lock:
@@ -188,7 +188,7 @@ class Transport:
                             ev.set()
                         continue
                     # It's a data fragment — send ACK
-                    ack = _HDR.pack(tid, seq, total, FLAG_ACK)
+                    ack = _HDR.pack(b"FRAG", tid, seq, total, FLAG_ACK)
                     self._sock.sendto(ack, addr)
                     self._reassemble(addr, tid, seq, total, flags, data[HDR_SIZE:])
                     continue

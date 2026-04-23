@@ -99,16 +99,22 @@ class SessionManager:
         priv     = tuple(peer_info["priv"])
         ed_pub   = peer_info["ed25519"]
 
-        sess = PeerSession(name, pub, priv, ed_pub, self._id)
-
-        # Choose initial address (LAN vs WAN)
-        if list(pub)[0] == my_pub_addr[0]:
-            sess.addr = priv
-        else:
-            sess.addr = pub
-
         with self._lock:
-            self._sessions[name] = sess
+            if name in self._sessions:
+                sess = self._sessions[name]
+                if sess.state != PeerState.DEAD:
+                    return sess
+                # If DEAD, we will restart the connection process
+                sess.state = PeerState.PUNCHING
+                sess._session = Session() # reset DH
+            else:
+                sess = PeerSession(name, pub, priv, ed_pub, self._id)
+                self._sessions[name] = sess
+
+            if list(pub)[0] == my_pub_addr[0]:
+                sess.addr = priv
+            else:
+                sess.addr = pub
             self._addr_map[sess.addr] = name
 
         threading.Thread(
@@ -164,54 +170,35 @@ class SessionManager:
     def _punch_and_handshake(self, sess: PeerSession):
         log.info("Punching %s @ %s", sess.name, sess.addr)
         punch_pkt = json.dumps({"type": "punch", "from": self._name}).encode()
-        observed  = None
-
-        sock = self._sock
-        sock.settimeout(2.0)
-
-        def send_punches():
-            for _ in range(self._punch_count):
-                sock.sendto(punch_pkt, sess.addr)
-                time.sleep(self._punch_interval)
-
-        t = threading.Thread(target=send_punches, daemon=True)
-        t.start()
-
-        deadline = time.time() + (self._punch_count * self._punch_interval) + 3.0
-        while time.time() < deadline and observed is None:
-            try:
-                data, src = sock.recvfrom(4096)
-                try:
-                    msg = json.loads(data)
-                except Exception:
-                    continue
-                if msg.get("type") == "punch" and msg.get("from") == sess.name:
-                    observed = src
-                    sock.sendto(punch_pkt, src)
-            except socket.timeout:
-                continue
-
-        t.join()
-
-        if observed:
-            with self._lock:
-                old = sess.addr
-                sess.addr = observed
-                self._addr_map.pop(old, None)
-                self._addr_map[observed] = sess.name
-            log.info("Punch succeeded for %s: %s", sess.name, observed)
-        else:
-            log.warning("Punch may have failed for %s; trying original addr", sess.name)
-
+        
+        for _ in range(self._punch_count):
+            if sess.state == PeerState.READY:
+                break
+            self._sock.sendto(punch_pkt, sess.addr)
+            time.sleep(self._punch_interval)
+            
+        if sess.state != PeerState.READY:
+            # wait a bit for late incoming punches to be processed by Transport -> _handle_punch
+            time.sleep(1.0)
+            
+        log.info("Finished punching phase, sending hs_offer to %s @ %s", sess.name, sess.addr)
         self._send_hs_offer(sess)
 
     def _send_hs_offer(self, sess: PeerSession):
-        sess.state = PeerState.HANDSHAKE
-        pkt = json.dumps({
-            "type":   "hs_offer",
-            "from":   self._name,
-            "eph_pub": sess.eph_pub_bytes.hex(),
-        }).encode()
+        if sess.state == PeerState.READY:
+            pkt = json.dumps({
+                "type":    "hs_accept",
+                "from":    self._name,
+                "eph_pub": sess.eph_pub_bytes.hex(),
+            }).encode()
+        else:
+            sess.state = PeerState.HANDSHAKE
+            pkt = json.dumps({
+                "type":   "hs_offer",
+                "from":   self._name,
+                "eph_pub": sess.eph_pub_bytes.hex(),
+            }).encode()
+            
         for _ in range(5):
             self._sock.sendto(pkt, sess.addr)
             time.sleep(0.2)
@@ -221,12 +208,14 @@ class SessionManager:
     def _handle_punch(self, addr: tuple, msg: dict):
         peer_name = msg.get("from", "")
         with self._lock:
-            if addr not in self._addr_map and peer_name in self._sessions:
+            if peer_name in self._sessions:
                 sess = self._sessions[peer_name]
-                old  = sess.addr
-                sess.addr = addr
-                self._addr_map.pop(old, None)
-                self._addr_map[addr] = peer_name
+                if sess.addr != addr:
+                    old  = sess.addr
+                    sess.addr = addr
+                    self._addr_map.pop(old, None)
+                    self._addr_map[addr] = peer_name
+                    log.info("Observed real peer address from punch for %s: %s -> %s", peer_name, old, addr)
         # Echo punch back
         self._sock.sendto(json.dumps({"type": "punch", "from": self._name}).encode(), addr)
 
@@ -237,7 +226,11 @@ class SessionManager:
         if not sess:
             return
         peer_eph = bytes.fromhex(msg["eph_pub"])
-        sess.complete_dh(peer_eph)
+        if sess.state != PeerState.READY:
+            sess.complete_dh(peer_eph)
+            self._on_state(peer_name, PeerState.READY)
+            self._tx.add_known_peer(addr)
+            
         # Send our own offer/accept back
         pkt = json.dumps({
             "type":    "hs_accept",
@@ -245,8 +238,6 @@ class SessionManager:
             "eph_pub": sess.eph_pub_bytes.hex(),
         }).encode()
         self._sock.sendto(pkt, addr)
-        self._on_state(peer_name, PeerState.READY)
-        self._tx.add_known_peer(addr)
         log.info("Handshake complete with %s (offer)", peer_name)
 
     def _handle_hs_accept(self, addr: tuple, msg: dict):

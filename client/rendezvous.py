@@ -30,6 +30,15 @@ class RendezvousClient:
         # name → {"ed25519": bytes, "relay_x25519": bytes, "pub": [ip,port], "priv": [ip,port]}
         self._peer_cache: dict[str, dict] = {}
         self._cache_lock = threading.Lock()
+        
+        self._wait_event = threading.Event()
+        self._wait_response = None
+
+    def handle_message(self, msg: dict):
+        t = msg.get("type")
+        if t in ("peer", "error", "peer_list"):
+            self._wait_response = msg
+            self._wait_event.set()
 
     # ── Registration ──────────────────────────────────────────────────────────
 
@@ -78,27 +87,26 @@ class RendezvousClient:
         }
         deadline = time.time() + TIMEOUT * 2
         while time.time() < deadline:
+            self._wait_response = None
+            self._wait_event.clear()
             self._sock.sendto(json.dumps(payload).encode(), self._server)
-            self._sock.settimeout(1.5)
-            try:
-                data, addr = self._sock.recvfrom(2048)
-                if addr == self._server:
-                    msg = json.loads(data)
-                    if msg.get("type") == "peer" and msg.get("name") == target:
-                        info = {
-                            "pub":          tuple(msg["pub"]),
-                            "priv":         tuple(msg["priv"]),
-                            "ed25519":      bytes.fromhex(msg["ed25519"]),
-                            "relay_x25519": bytes.fromhex(msg["relay_x25519"]),
-                        }
-                        with self._cache_lock:
-                            self._peer_cache[target] = info
-                        log.info("Got peer info for %s: %s", target, info["pub"])
-                        return info
-                    if msg.get("type") == "error":
-                        raise RuntimeError(f"Rendezvous error: {msg.get('msg')}")
-            except socket.timeout:
-                continue
+            
+            if self._wait_event.wait(timeout=1.5):
+                msg = self._wait_response
+                if msg and msg.get("type") == "peer" and msg.get("name") == target:
+                    info = {
+                        "name":         target,
+                        "pub":          tuple(msg["pub"]),
+                        "priv":         tuple(msg["priv"]),
+                        "ed25519":      bytes.fromhex(msg["ed25519"]),
+                        "relay_x25519": bytes.fromhex(msg["relay_x25519"]),
+                    }
+                    with self._cache_lock:
+                        self._peer_cache[target] = info
+                    log.info("Got peer info for %s: %s", target, info["pub"])
+                    return info
+                if msg and msg.get("type") == "error":
+                    raise RuntimeError(f"Rendezvous error: {msg.get('msg')}")
         raise TimeoutError(f"Peer lookup for {target} timed out")
 
     def get_all_peers(self) -> list[dict]:
@@ -106,26 +114,24 @@ class RendezvousClient:
         Ask the rendezvous server for the list of ALL currently registered peers.
         Returns list of {"name": str, "pub": tuple, "ed25519": bytes, "relay_x25519": bytes}
         """
+        self._wait_response = None
+        self._wait_event.clear()
         self._sock.sendto(json.dumps({"type": "list"}).encode(), self._server)
-        self._sock.settimeout(3.0)
-        try:
-            data, addr = self._sock.recvfrom(65535)
-            if addr == self._server:
-                msg = json.loads(data)
-                if msg.get("type") == "peer_list":
-                    result = []
-                    for p in msg.get("peers", []):
-                        result.append({
-                            "name":         p["name"],
-                            "pub":          tuple(p["pub"]),
-                            "priv":         tuple(p["priv"]),
-                            "ed25519":      bytes.fromhex(p["ed25519"]),
-                            "relay_x25519": bytes.fromhex(p["relay_x25519"]),
-                        })
-                    return result
-        except socket.timeout:
-            pass
-        return []
+        
+        if self._wait_event.wait(timeout=3.0):
+            msg = self._wait_response
+            if msg and msg.get("type") == "peer_list":
+                result =[]
+                for p in msg.get("peers", []):
+                    result.append({
+                        "name":         p["name"],
+                        "pub":          tuple(p["pub"]),
+                        "priv":         tuple(p["priv"]),
+                        "ed25519":      bytes.fromhex(p["ed25519"]),
+                        "relay_x25519": bytes.fromhex(p["relay_x25519"]),
+                    })
+                return result
+        return[]
 
     def get_cached_peer(self, name: str) -> dict | None:
         with self._cache_lock:
