@@ -118,6 +118,10 @@ class SimpleUI:
         else:
             print(f"\n[{sender}] {text}")
 
+        if self.active_peer is None and sender != self.name and not is_system and not is_media:
+            self.active_peer = conv
+            print(f"[*] Auto-selected active peer: '{conv}'. You can now type messages directly.")
+
         # Auto-echo logic
         if self.echo_mode and sender != self.name and not is_system and not is_media:
             logging.getLogger("ui").info("Auto-echoing message back to %s", conv)
@@ -128,6 +132,10 @@ class SimpleUI:
 
     def update_peer_state(self, name, state):
         print(f"\n[*] Peer '{name}' state changed to: {state}")
+        if state == "READY" and self.active_peer is None:
+            self.active_peer = name
+            print(f"[*] Auto-selected active peer: '{name}'. You can now type messages directly.")
+
 
 
 def main():
@@ -275,9 +283,12 @@ def main():
             peer_info = rendezvous.get_cached_peer(peer_name)
             if not peer_info:
                 peer_info = rendezvous.request_peer(peer_name)
-            session_mgr.connect(peer_info, my_pub_addr)
+            sess = session_mgr.connect(peer_info, my_pub_addr)
+            if sess.state.name == "READY" and ui_app:
+                ui_app.update_peer_state(peer_name, "READY")
         except Exception as e:
             log.error("Failed looking up %s: %s", peer_name, e)
+
 
     def ui_create_group(name, members):
         log.error("Groups are not supported in this client version.")
