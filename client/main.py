@@ -207,7 +207,7 @@ def main():
     # Route rendezvous packets caught by transport back to rendezvous client
     def on_rendezvous_msg(addr, msg):
         if addr == rendezvous.server_addr:
-            if msg.get("type") == "peer":
+            if msg.get("type") in ("peer", "peer_online"):
                 rendezvous.handle_message(msg)
                 peer_name = msg.get("name")
                 if peer_name:
@@ -219,6 +219,10 @@ def main():
                         "relay_x25519": bytes.fromhex(msg["relay_x25519"]),
                     }
                     rendezvous.cache_peer(peer_name, info)
+                    if msg.get("type") == "peer_online":
+                        log.info("Peer %s is online, sending manifest if needed", peer_name)
+                        relay_mgr.send_manifest(info)
+                    
                     if not session_mgr.get_session(peer_name):
                         log.info("Received unsolicited intro for %s, starting connection", peer_name)
                         session_mgr.connect(info, my_pub_addr)
@@ -226,6 +230,7 @@ def main():
                 rendezvous.handle_message(msg)
 
     transport.on_control("peer", on_rendezvous_msg)
+    transport.on_control("peer_online", on_rendezvous_msg)
     transport.on_control("error", on_rendezvous_msg)
     transport.on_control("peer_list", on_rendezvous_msg)
 
@@ -242,7 +247,9 @@ def main():
     )
     
     transport.on_control("relay", relay_mgr.handle_envelope)
-    transport.on_control("relay_fetch", relay_mgr.handle_fetch)
+    transport.on_control("relay_manifest", relay_mgr.handle_manifest)
+    transport.on_control("relay_fetch_msg", relay_mgr.handle_fetch_msg)
+    transport.on_control("relay_delete", relay_mgr.handle_delete)
     transport.on_control("relay_deliver", relay_mgr.handle_deliver)
     transport.on_control("relay_have", relay_mgr.handle_have)
 
@@ -286,12 +293,6 @@ def main():
         log.info("Shutting down...")
         transport.stop()
         sys.exit(0)
-
-    # Ask the relay network if there are any offline messages waiting for us
-    threading.Thread(
-        target=lambda: relay_mgr.announce_online([tuple(p["pub"]) for p in rendezvous.get_all_peers()]), 
-        daemon=True
-    ).start()
 
     # 8. Start UI App
     if ui_mode == "simple":

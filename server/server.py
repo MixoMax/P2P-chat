@@ -58,13 +58,14 @@ def main():
                 if not name:
                     continue
 
-                peers[name] = {
+                new_peer = {
                     "name": name,
                     "pub": list(addr),
                     "priv": msg.get("priv", list(addr)),
                     "ed25519": msg.get("ed25519", ""),
                     "relay_x25519": msg.get("relay_x25519", "")
                 }
+                peers[name] = new_peer
                 
                 reply = json.dumps({
                     "type": "registered", 
@@ -72,7 +73,16 @@ def main():
                 }).encode('utf-8')
                 
                 sock.sendto(reply, addr)
-                print(f"[REGISTER] {name} (pub={addr}, priv={peers[name]['priv']})")
+                print(f"[REGISTER] {name} (pub={addr}, priv={new_peer['priv']})")
+
+                # Broadcast peer_online to all other peers
+                online_msg = json.dumps({"type": "peer_online", **new_peer}).encode('utf-8')
+                for p_name, p_info in peers.items():
+                    if p_name != name:
+                        try:
+                            sock.sendto(online_msg, tuple(p_info["pub"]))
+                        except Exception:
+                            pass
 
             # 2. Handle Peer Lookups / Direct Connects
             elif msg_type == "connect":

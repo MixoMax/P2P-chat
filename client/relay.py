@@ -30,6 +30,7 @@ Availability gossip:
 """
 
 import json, logging, threading, time, uuid
+from collections import defaultdict
 from typing import Callable
 
 import config
@@ -53,6 +54,11 @@ class RelayManager:
         self._get_peers   = get_all_peers_fn
         self._on_deliver  = on_deliver
         self._rb_interval = config.get("relay_rebroadcast_interval")
+        
+        self._delivered_ids = set()
+        self._pending_fetches = defaultdict(set)
+        self._pending_deletes = defaultdict(list)
+        
         self._lock        = threading.Lock()
 
         threading.Thread(target=self._rebroadcast_loop, daemon=True, name="relay-rb").start()
@@ -121,34 +127,79 @@ class RelayManager:
             if hops_left - 1 > 0:
                 self._regossip_one(msg_id, recipient, sender, hops_left - 1, payload)
 
-    def handle_fetch(self, addr: tuple, msg: dict):
-        """Peer came online and is asking for pending messages."""
-        peer_name = msg.get("name", "")
-        if not peer_name:
+    def send_manifest(self, peer_info: dict):
+        """Server announced peer is online. Send them a manifest of their messages."""
+        peer_name = peer_info.get("name", "")
+        peer_pub  = peer_info.get("pub")
+        if not peer_name or not peer_pub:
             return
         pending = self._store.pending_for(peer_name)
-        log.info("relay: delivering %d pending messages to %s", len(pending), peer_name)
-        for m in pending:
-            deliver_pkt = {
-                "type":    "relay_deliver",
-                "id":      m["id"],
-                "sender":  m["sender"],
-                "payload": m["payload"].hex() if isinstance(m["payload"], bytes) else m["payload"].hex(),
-            }
-            try:
-                # payload from store is already bytes
-                p = m["payload"]
-                if isinstance(p, bytes):
-                    deliver_pkt["payload"] = p.hex()
-                self._send(addr, deliver_pkt)
-                self._store.mark_delivered(m["id"])
-            except Exception as e:
-                log.debug("relay: deliver to %s failed: %s", peer_name, e)
+        if not pending:
+            return
+        
+        ids = [m["id"] for m in pending]
+        log.info("relay: sending manifest with %d ids to %s", len(ids), peer_name)
+        try:
+            self._send(peer_pub, {"type": "relay_manifest", "name": self._name, "ids": ids})
+        except Exception as e:
+            log.debug("relay: manifest to %s failed: %s", peer_name, e)
+
+    def handle_manifest(self, addr: tuple, msg: dict):
+        """Received a manifest of waiting messages from a relay peer."""
+        ids = msg.get("ids", [])
+        if not ids:
+            return
+
+        needed_ids = []
+        with self._lock:
+            for mid in ids:
+                if mid not in self._delivered_ids:
+                    needed_ids.append(mid)
+                    self._delivered_ids.add(mid)
+
+            if needed_ids:
+                log.info("relay: fetching %d needed messages from %s", len(needed_ids), addr)
+                self._pending_deletes[addr] = ids
+                self._pending_fetches[addr] = set(needed_ids)
+                try:
+                    self._send(addr, {"type": "relay_fetch_msg", "ids": needed_ids})
+                except Exception:
+                    pass
+            else:
+                log.info("relay: already have all messages in manifest from %s, telling them to delete", addr)
+                try:
+                    self._send(addr, {"type": "relay_delete", "ids": ids})
+                except Exception:
+                    pass
+
+    def handle_fetch_msg(self, addr: tuple, msg: dict):
+        """A peer wants to fetch specific messages we manifested."""
+        ids = msg.get("ids", [])
+        for mid in ids:
+            m = self._store.get(mid)
+            if m:
+                deliver_pkt = {
+                    "type":    "relay_deliver",
+                    "id":      m["id"],
+                    "sender":  m["sender"],
+                    "payload": m["payload"].hex() if isinstance(m["payload"], bytes) else m["payload"].hex(),
+                }
+                try:
+                    self._send(addr, deliver_pkt)
+                except Exception as e:
+                    log.debug("relay: deliver %s to %s failed: %s", mid, addr, e)
+
+    def handle_delete(self, addr: tuple, msg: dict):
+        """Peer told us they got the messages, we can delete them."""
+        ids = msg.get("ids", [])
+        log.info("relay: deleting %d messages for %s", len(ids), addr)
+        for mid in ids:
+            self._store.mark_delivered(mid)
 
     def handle_deliver(self, addr: tuple, msg: dict):
         """A relay node is delivering a stored message to us."""
         sender  = msg.get("sender", "")
-        msg_id  = msg.get("id", "")
+        msg_id  = msg_id = msg.get("id", "")
         try:
             payload   = bytes.fromhex(msg.get("payload", ""))
             plaintext = self._rid.open(payload)
@@ -156,20 +207,23 @@ class RelayManager:
         except Exception as e:
             log.debug("relay: failed to open delivered message: %s", e)
 
+        with self._lock:
+            if addr in self._pending_fetches:
+                self._pending_fetches[addr].discard(msg_id)
+                # Once we got all requested messages, mass delete the original manifest
+                if not self._pending_fetches[addr]:
+                    delete_ids = self._pending_deletes.pop(addr, [])
+                    if delete_ids:
+                        try:
+                            self._send(addr, {"type": "relay_delete", "ids": delete_ids})
+                        except Exception:
+                            pass
+
     def handle_have(self, addr: tuple, msg: dict):
         """Peer told us which relay messages they hold — update availability."""
         ids = msg.get("ids", [])
         for mid in ids:
             self._store.increment_availability(mid)
-
-    def announce_online(self, known_peer_addrs: list[tuple]):
-        """Call when we come online to ask all known peers for pending messages."""
-        fetch_pkt = {"type": "relay_fetch", "name": self._name}
-        for addr in known_peer_addrs:
-            try:
-                self._send(addr, fetch_pkt)
-            except Exception:
-                pass
 
     # ── Internal ──────────────────────────────────────────────────────────────
 
