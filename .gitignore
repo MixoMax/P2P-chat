@@ -1,2 +1,3 @@
 *.pem
 digest.txt
+/client/__pycache__
